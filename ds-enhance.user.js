@@ -1616,3 +1616,1346 @@
 
   }); // end waitForDOM
 })();
+
+/* ═══════════════════════════════════════════════════════════════════
+   侧边栏「项目分类」折叠菜单（独立模块 / UI 升级版）
+   - 原生 SVG 图标 + 分类管理面板入口
+   - 分类右键菜单：加入当前对话 / 重命名 / 删除
+   - 不依赖任何哈希 class，全部通过文本 + DOM 结构关系定位
+   - 每秒轮询 localStorage.dse_categories，数据变化自动重绘
+   - MutationObserver 防抖，React 冲洗后自动补挂
+   ═══════════════════════════════════════════════════════════════════ */
+(function () {
+  'use strict';
+
+  const FLAG = '__DSE_SIDEBAR_CATS_INSTALLED__';
+  if (window[FLAG]) return;
+  window[FLAG] = true;
+
+  const UI_ID = 'dse-sidebar-cats';
+  const STYLE_ID = UI_ID + '-style';
+  const MENU_ID = 'dse-cat-context-menu';
+  const LS_CATS = 'dse_categories';
+  const LS_EXPANDED = 'dse_sidebar_cats_expanded_v1';
+  const LS_TITLE_CACHE = 'dse_sidebar_cats_title_cache_v1';
+
+  const emptyState = () => ({ raw: null, categories: [], sessionMap: {}, unavailable: false });
+
+  let state = emptyState();
+  let container = null;
+  let bodyEl = null;
+  let totalEl = null;
+  let expanded = loadExpanded();
+  let titleCache = loadTitleCache();
+  let titleSaveTimer = null;
+  let mountTimer = null;
+  let lastMountTry = 0;
+  let lastTitleScan = 0;
+  let pollTimer = null;
+  let observer = null;
+  let booted = false;
+  let contextMenu = null;
+  let contextCatId = null;
+  let contextListenersBound = false;
+
+  // ═══════════════════════════════════════════════════════════════════
+  //  基础工具
+  // ═══════════════════════════════════════════════════════════════════
+  function norm(value) {
+    return String(value == null ? '' : value)
+      .replace(/[\u200B-\u200D\uFEFF]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function cleanTitle(value) {
+    let t = norm(value);
+    if (!t) return '';
+    t = t.replace(/^[·•]\s*/, '');
+    if (t.length > 180) t = t.slice(0, 180);
+    if (t === '开启新对话') return '';
+    return t;
+  }
+
+  function safeColor(value) {
+    const c = String(value == null ? '' : value).trim();
+    if (/^#(?:[0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i.test(c)) return c;
+    if (/^rgba?\([\d\s.,%]+\)$/i.test(c)) return c;
+    return '#6b7280';
+  }
+
+  function getCurrentSid() {
+    const m = location.href.match(/\/s\/([A-Za-z0-9_-]{8,})/);
+    return m ? m[1] : '';
+  }
+
+  function loadExpanded() {
+    try {
+      const arr = JSON.parse(localStorage.getItem(LS_EXPANDED) || '[]');
+      if (Array.isArray(arr)) {
+        return new Set(arr.filter(x => typeof x === 'string'));
+      }
+    } catch { /* ignore */ }
+    return new Set();
+  }
+
+  function saveExpanded() {
+    try {
+      localStorage.setItem(LS_EXPANDED, JSON.stringify([...expanded]));
+    } catch { /* ignore */ }
+  }
+
+  function loadTitleCache() {
+    const out = Object.create(null);
+    try {
+      const obj = JSON.parse(localStorage.getItem(LS_TITLE_CACHE) || '{}');
+      if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+        for (const [sid, title] of Object.entries(obj)) {
+          if (typeof title === 'string' && title) out[sid] = title;
+        }
+      }
+    } catch { /* ignore */ }
+    return out;
+  }
+
+  function scheduleTitleSave() {
+    if (titleSaveTimer) return;
+    titleSaveTimer = setTimeout(() => {
+      titleSaveTimer = null;
+      try {
+        const keys = Object.keys(titleCache);
+        if (keys.length > 900) {
+          keys.slice(0, keys.length - 900).forEach(k => delete titleCache[k]);
+        }
+        localStorage.setItem(LS_TITLE_CACHE, JSON.stringify(titleCache));
+      } catch { /* ignore */ }
+    }, 600);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  //  读取 / 校验 localStorage 数据
+  // ═══════════════════════════════════════════════════════════════════
+  function readCats() {
+    let raw = null;
+    try {
+      raw = localStorage.getItem(LS_CATS);
+    } catch {
+      return { ...emptyState(), unavailable: true };
+    }
+
+    if (!raw) return { ...emptyState(), raw: '' };
+
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return { ...emptyState(), raw };
+    }
+
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { ...emptyState(), raw };
+    }
+
+    const categories = [];
+    const catIds = new Set();
+    if (Array.isArray(parsed.categories)) {
+      for (const item of parsed.categories) {
+        if (!item || typeof item !== 'object') continue;
+        if (typeof item.id !== 'string' || !item.id) continue;
+        if (typeof item.name !== 'string') continue;
+        const id = item.id.trim();
+        if (!id || catIds.has(id)) continue;
+        catIds.add(id);
+        categories.push({
+          id,
+          name: norm(item.name) || '未命名分类',
+          color: safeColor(item.color)
+        });
+      }
+    }
+
+    const sessionMap = Object.create(null);
+    if (parsed.sessionMap && typeof parsed.sessionMap === 'object' && !Array.isArray(parsed.sessionMap)) {
+      for (const [sid, catList] of Object.entries(parsed.sessionMap)) {
+        if (typeof sid !== 'string' || !sid || sid.length > 160) continue;
+        if (!Array.isArray(catList)) continue;
+        const valid = [...new Set(catList.filter(id => typeof id === 'string' && catIds.has(id)))];
+        if (valid.length) sessionMap[sid] = valid;
+      }
+    }
+
+    return { raw, categories, sessionMap, unavailable: false };
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  //  通过文本定位（绝不依赖 class）
+  // ═══════════════════════════════════════════════════════════════════
+  function textParents(label) {
+    const out = [];
+    if (!document.body) return out;
+
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        if (!node.nodeValue || norm(node.nodeValue) !== label) {
+          return NodeFilter.FILTER_REJECT;
+        }
+        const parent = node.parentElement;
+        if (!parent || parent.closest('#' + UI_ID) || parent.closest('script,style,noscript')) {
+          return NodeFilter.FILTER_REJECT;
+        }
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    });
+
+    while (walker.nextNode()) {
+      const parent = walker.currentNode.parentElement;
+      if (parent) out.push(parent);
+    }
+    return out;
+  }
+
+  function isLeftRegion(el) {
+    if (!el || !el.isConnected) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width < 20 || r.height < 8) return false;
+    if (r.width > 560 || r.right <= 0) return false;
+    const cs = getComputedStyle(el);
+    if (cs.display === 'none' || cs.visibility === 'hidden' || Number(cs.opacity) === 0) return false;
+    return r.left < Math.min(window.innerWidth * 0.45, 480);
+  }
+
+  function findNewChat() {
+    const seen = new Set();
+    const list = [];
+    const label = '开启新对话';
+
+    for (const parent of textParents(label)) {
+      let el = parent.closest('button,[role="button"],a') || parent;
+      const elText = norm(el.innerText || el.textContent);
+      // 避免 closest 命中了过大的外层容器
+      if (!elText.includes(label) || elText.length > 40) el = parent;
+      if (el.tagName === 'A' && extractSid(el.getAttribute('href'))) continue;
+      if (seen.has(el)) continue;
+      if (!isLeftRegion(el)) continue;
+
+      seen.add(el);
+      const r = el.getBoundingClientRect();
+      list.push({
+        el,
+        exact: norm(el.innerText || el.textContent) === label ? 1 : 0,
+        top: r.top,
+        width: r.width
+      });
+    }
+
+    list.sort((a, b) => (b.exact - a.exact) || (a.top - b.top) || (a.width - b.width));
+    return list.length ? list[0].el : null;
+  }
+
+  function findHistoryMarker(newChat) {
+    const nr = newChat.getBoundingClientRect();
+    const labels = ['今天', '昨天', '7 天内', '7天内', '更早'];
+
+    for (const label of labels) {
+      const list = [];
+      for (const parent of textParents(label)) {
+        if (parent.closest('a,button,[role="button"]')) continue;
+        if (!isLeftRegion(parent)) continue;
+        const r = parent.getBoundingClientRect();
+        if (r.bottom <= nr.bottom - 2) continue;
+        list.push({ el: parent, top: r.top, height: r.height });
+      }
+      list.sort((a, b) => (a.top - b.top) || (a.height - b.height));
+      if (list.length) return list[0].el;
+    }
+    return null;
+  }
+
+  function commonAncestor(a, b) {
+    const set = new Set();
+    let node = a;
+    while (node && node !== document.documentElement) {
+      set.add(node);
+      node = node.parentElement;
+    }
+    node = b;
+    while (node && node !== document.documentElement) {
+      if (set.has(node)) return node;
+      node = node.parentElement;
+    }
+    return null;
+  }
+
+  function childUnder(ancestor, el) {
+    let node = el;
+    while (node && node.parentElement !== ancestor) node = node.parentElement;
+    return node && node.parentElement === ancestor ? node : null;
+  }
+
+  function isSidebarAncestor(el) {
+    if (!el || el === document.body || el === document.documentElement) return false;
+    const r = el.getBoundingClientRect();
+    const maxWidth = Math.min(620, window.innerWidth * 0.7);
+    return r.width >= 120 && r.width <= maxWidth && r.height >= 80 &&
+      r.left < window.innerWidth * 0.5;
+  }
+
+  function findMountSpot() {
+    const newChat = findNewChat();
+    if (!newChat) return null;
+
+    const historyMarker = findHistoryMarker(newChat);
+    if (historyMarker) {
+      const common = commonAncestor(newChat, historyMarker);
+      if (common && common !== document.body && isSidebarAncestor(common)) {
+        const newChatBranch = childUnder(common, newChat);
+        const historyBranch = childUnder(common, historyMarker);
+        if (newChatBranch && historyBranch && newChatBranch !== historyBranch &&
+            historyBranch.parentElement === common) {
+          // 插在“新对话”和“今天/昨天”之间
+          return { parent: common, before: historyBranch };
+        }
+      }
+    }
+
+    // 没有历史标题（例如历史为空）时的降级挂载：
+    // 从“开启新对话”向上找到高度合理的块，插在它后面。
+    let block = newChat;
+    let parent = newChat.parentElement;
+    while (parent && parent !== document.body && parent !== document.documentElement) {
+      const r = parent.getBoundingClientRect();
+      if (r.width > 620 || r.height > 220) break;
+      block = parent;
+      parent = parent.parentElement;
+    }
+
+    const host = block.parentElement;
+    if (!host || host === document.body || host === document.documentElement) return null;
+    if (host.closest('button,a,[role="button"]')) return null;
+
+    const hr = host.getBoundingClientRect();
+    if (hr.width > Math.min(700, window.innerWidth * 0.8)) return null;
+    if (hr.left > window.innerWidth * 0.55) return null;
+
+    return { parent: host, before: block.nextSibling };
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  //  标题解析：原脚本 allSessions -> DOM -> 缓存 -> ID 前 6 位
+  // ═══════════════════════════════════════════════════════════════════
+  function getSharedSessions() {
+    // 如果本模块被粘在 waitForDOM 回调内部，这里能直接访问 allSessions
+    try {
+      if (typeof allSessions !== 'undefined' && Array.isArray(allSessions)) {
+        return allSessions;
+      }
+    } catch { /* ignore */ }
+
+    try {
+      if (Array.isArray(window.__DSE_ALL_SESSIONS__)) {
+        return window.__DSE_ALL_SESSIONS__;
+      }
+    } catch { /* ignore */ }
+
+    try {
+      const api = window.__DSE_ENHANCE__;
+      if (api) {
+        if (Array.isArray(api.allSessions)) return api.allSessions;
+        if (typeof api.getAllSessions === 'function') {
+          const sessions = api.getAllSessions();
+          if (Array.isArray(sessions)) return sessions;
+        }
+      }
+    } catch { /* ignore */ }
+
+    return [];
+  }
+
+  function sharedTitleMap() {
+    const map = new Map();
+    for (const session of getSharedSessions()) {
+      if (!session || typeof session !== 'object') continue;
+      const sid = session.id || session.chat_session_id || session.chatSessionId || session.session_id;
+      const title = cleanTitle(session.title);
+      if (typeof sid === 'string' && sid && title && !map.has(sid)) {
+        map.set(sid, title);
+      }
+    }
+    return map;
+  }
+
+  function bridgeTitle(sid) {
+    try {
+      const api = window.__DSE_ENHANCE__;
+      if (api && typeof api.getSessionTitle === 'function') {
+        const t = cleanTitle(api.getSessionTitle(sid));
+        if (t) return t;
+      }
+      if (typeof window.__DSE_GET_SESSION_TITLE__ === 'function') {
+        const t = cleanTitle(window.__DSE_GET_SESSION_TITLE__(sid));
+        if (t) return t;
+      }
+    } catch { /* ignore */ }
+    return '';
+  }
+
+  function extractSid(href) {
+    if (!href) return null;
+    try {
+      const url = new URL(href, location.origin);
+      const m = url.pathname.match(/\/s\/([A-Za-z0-9_-]{8,})/);
+      return m ? m[1] : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function rememberTitle(sid, title) {
+    const t = cleanTitle(title);
+    if (!sid || !t || titleCache[sid] === t) return false;
+    titleCache[sid] = t;
+    scheduleTitleSave();
+    return true;
+  }
+
+  function scanDomTitles() {
+    lastTitleScan = Date.now();
+    if (!document.body) return false;
+    let changed = false;
+    const fromAnchors = new Set();
+
+    document.querySelectorAll('a[href*="/s/"]').forEach(a => {
+      if (a.closest('#' + UI_ID)) return;
+      const sid = extractSid(a.getAttribute('href'));
+      if (!sid) return;
+      const title = cleanTitle(a.innerText || a.textContent) || cleanTitle(a.getAttribute('title'));
+      if (title) fromAnchors.add(sid);
+      if (rememberTitle(sid, title)) changed = true;
+    });
+
+    for (const attr of ['data-session-id', 'data-chat-session-id']) {
+      document.querySelectorAll('[' + attr + ']').forEach(el => {
+        if (el.closest('#' + UI_ID)) return;
+        const sid = norm(el.getAttribute(attr));
+        if (!/^[A-Za-z0-9_-]{8,160}$/.test(sid)) return;
+        if (fromAnchors.has(sid)) return;
+        const title = cleanTitle(el.innerText || el.textContent) || cleanTitle(el.getAttribute('title'));
+        if (rememberTitle(sid, title)) changed = true;
+      });
+    }
+
+    return changed;
+  }
+
+  function currentPageTitle(sid) {
+    if (!sid || getCurrentSid() !== sid) return '';
+    let t = norm(document.title || '');
+    t = t.replace(/^DeepSeek\s*[-–—|]\s*/i, '').replace(/\s*[-–—|]\s*DeepSeek.*$/i, '');
+    if (!t || /^DeepSeek$/i.test(t) || t === '探索未至之境') return '';
+    return cleanTitle(t);
+  }
+
+  function resolveTitle(sid, sharedMap) {
+    const fromShared = sharedMap && sharedMap.get(sid);
+    if (fromShared) return fromShared;
+    if (titleCache[sid]) return titleCache[sid];
+    const fromBridge = bridgeTitle(sid);
+    if (fromBridge) return fromBridge;
+    const fromPage = currentPageTitle(sid);
+    if (fromPage) return fromPage;
+    return sid.slice(0, 6);
+  }
+
+  function updateVisibleTitles() {
+    if (!bodyEl || !bodyEl.isConnected) return;
+
+    const beforeMap = sharedTitleMap();
+    let missing = false;
+    bodyEl.querySelectorAll('a[data-sid]').forEach(a => {
+      const sid = a.dataset.sid;
+      if (!beforeMap.has(sid) && !titleCache[sid]) missing = true;
+    });
+
+    if (missing && Date.now() - lastTitleScan > 2000) {
+      scanDomTitles();
+    }
+
+    const sharedMap = sharedTitleMap();
+    bodyEl.querySelectorAll('a[data-sid]').forEach(a => {
+      const sid = a.dataset.sid;
+      if (!sid) return;
+      const title = resolveTitle(sid, sharedMap);
+      const textEl = a.querySelector('.dse-sc-session-title');
+      if (textEl && textEl.textContent !== title) textEl.textContent = title;
+      if (a.getAttribute('title') !== title) a.setAttribute('title', title);
+      if (textEl) textEl.classList.toggle('is-fallback', title === sid.slice(0, 6));
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  //  CSS
+  // ═══════════════════════════════════════════════════════════════════
+  const CSS = `
+    #dse-sidebar-cats{
+      --dse-sc-text:#c7c7ce;
+      --dse-sc-muted:#7c7c85;
+      --dse-sc-hover:rgba(255,255,255,.055);
+      --dse-sc-line:rgba(255,255,255,.06);
+      margin:6px 8px 8px;
+      padding:7px 5px 5px;
+      border:1px solid rgba(255,255,255,.055);
+      border-radius:12px;
+      background:rgba(255,255,255,.028);
+      color:var(--dse-sc-text);
+      font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,"PingFang SC","Microsoft YaHei",sans-serif;
+      font-size:13px;
+      line-height:1.45;
+      text-align:left;
+      box-sizing:border-box;
+      width:auto;
+      max-width:100%;
+      flex:0 0 auto;
+      overflow:hidden;
+    }
+    #dse-sidebar-cats *{box-sizing:border-box}
+    #dse-sidebar-cats .dse-sc-head{
+      display:flex;align-items:center;gap:6px;
+      padding:2px 7px 6px;user-select:none;
+    }
+    #dse-sidebar-cats .dse-sc-head-main{
+      display:flex;align-items:center;gap:6px;
+      flex:1 1 auto;min-width:0;
+    }
+    #dse-sidebar-cats .dse-sc-icon{
+      display:inline-flex;align-items:center;justify-content:center;
+      flex:0 0 auto;color:#4d6bfe;
+    }
+    #dse-sidebar-cats .dse-sc-icon svg{display:block;width:14px;height:14px}
+    #dse-sidebar-cats .dse-sc-title{
+      font-size:12px;font-weight:600;color:#9898a2;
+      letter-spacing:.02em;white-space:nowrap;
+    }
+    #dse-sidebar-cats .dse-sc-total{
+      margin-left:auto;font-size:10.5px;color:#62626c;
+      background:rgba(255,255,255,.045);padding:1px 6px;
+      border-radius:8px;line-height:1.5;
+    }
+    #dse-sidebar-cats .dse-sc-settings{
+      width:22px;height:22px;padding:0;border:0;border-radius:6px;
+      display:inline-flex;align-items:center;justify-content:center;
+      flex:0 0 auto;background:transparent;color:#6f6f78;
+      cursor:pointer;outline:none;
+      -webkit-appearance:none;appearance:none;
+      transition:background .14s ease,color .14s ease;
+    }
+    #dse-sidebar-cats .dse-sc-settings svg{display:block;width:14px;height:14px}
+    #dse-sidebar-cats .dse-sc-settings:hover{
+      background:rgba(255,255,255,.08);color:#9db0ff;
+    }
+    #dse-sidebar-cats .dse-sc-settings:focus-visible{
+      box-shadow:inset 0 0 0 1px rgba(77,107,254,.75);
+    }
+    #dse-sidebar-cats .dse-sc-body{
+      max-height:42vh;
+      max-height:min(42vh,420px);
+      overflow-y:auto;overflow-x:hidden;
+      overscroll-behavior:contain;
+      scrollbar-width:thin;
+      scrollbar-color:rgba(255,255,255,.16) transparent;
+      padding:0 1px;
+    }
+    #dse-sidebar-cats .dse-sc-body::-webkit-scrollbar{width:5px}
+    #dse-sidebar-cats .dse-sc-body::-webkit-scrollbar-thumb{
+      background:rgba(255,255,255,.14);border-radius:3px;
+    }
+    #dse-sidebar-cats .dse-sc-body::-webkit-scrollbar-track{background:transparent}
+    #dse-sidebar-cats .dse-sc-cat{margin:1px 0}
+    #dse-sidebar-cats .dse-sc-cat-head{
+      display:flex;align-items:center;gap:7px;
+      min-height:30px;padding:5px 7px;border-radius:8px;
+      cursor:pointer;user-select:none;outline:none;
+      transition:background .14s ease,color .14s ease;
+    }
+    #dse-sidebar-cats .dse-sc-cat-head:hover{background:var(--dse-sc-hover)}
+    #dse-sidebar-cats .dse-sc-cat-head:focus-visible{
+      box-shadow:inset 0 0 0 1px rgba(122,162,247,.65);
+    }
+    #dse-sidebar-cats .dse-sc-dot{
+      width:8px;height:8px;border-radius:50%;flex:0 0 auto;
+      box-shadow:0 0 0 3px rgba(255,255,255,.025);
+    }
+    #dse-sidebar-cats .dse-sc-name{
+      flex:1 1 auto;min-width:0;overflow:hidden;
+      text-overflow:ellipsis;white-space:nowrap;
+      font-size:12.5px;color:#bcbcc4;
+    }
+    #dse-sidebar-cats .dse-sc-count{
+      flex:0 0 auto;font-size:10.5px;color:#666670;
+      min-width:14px;text-align:right;
+    }
+    #dse-sidebar-cats .dse-sc-chevron{
+      flex:0 0 auto;width:12px;text-align:center;color:#64646e;
+      font-size:14px;line-height:1;transition:transform .16s ease;
+    }
+    #dse-sidebar-cats .dse-sc-cat.is-open > .dse-sc-cat-head .dse-sc-chevron{
+      transform:rotate(90deg);
+    }
+    #dse-sidebar-cats .dse-sc-sessions{
+      display:none;margin:1px 0 4px 11px;padding:1px 0 1px 8px;
+      border-left:1px solid var(--dse-sc-line);
+    }
+    #dse-sidebar-cats .dse-sc-cat.is-open > .dse-sc-sessions{display:block}
+    #dse-sidebar-cats .dse-sc-session{
+      display:flex;align-items:center;gap:6px;
+      padding:5px 7px;margin:1px 0;border-radius:7px;
+      color:#9696a0;text-decoration:none;
+      font-size:12.5px;line-height:1.4;
+      transition:background .12s ease,color .12s ease;
+    }
+    #dse-sidebar-cats .dse-sc-session:hover{
+      background:var(--dse-sc-hover);color:#e7e7ec;text-decoration:none;
+    }
+    #dse-sidebar-cats .dse-sc-session.is-active{
+      background:rgba(122,162,247,.10);color:#adc5ff;
+    }
+    #dse-sidebar-cats .dse-sc-session-title{
+      flex:1 1 auto;min-width:0;overflow:hidden;
+      text-overflow:ellipsis;white-space:nowrap;
+    }
+    #dse-sidebar-cats .dse-sc-session-title.is-fallback{color:#74747e}
+    #dse-sidebar-cats .dse-sc-empty{
+      padding:4px 7px 6px;color:#5f5f68;
+      font-size:11.5px;line-height:1.5;
+    }
+
+    /* 分类右键菜单：挂 body，fixed 定位，参考原生暗色右键菜单 */
+    #dse-cat-context-menu{
+      position:fixed;
+      z-index:2147483647;
+      display:none;
+      min-width:212px;
+      max-width:280px;
+      padding:5px;
+      background:#2c2c2e;
+      color:#e6e6e8;
+      border:1px solid rgba(255,255,255,.085);
+      border-radius:10px;
+      box-shadow:0 12px 32px rgba(0,0,0,.55),0 2px 8px rgba(0,0,0,.35);
+      font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,"PingFang SC","Microsoft YaHei",sans-serif;
+      font-size:13px;
+      line-height:1.4;
+      text-align:left;
+      user-select:none;
+      box-sizing:border-box;
+    }
+    #dse-cat-context-menu.open{display:block}
+    #dse-cat-context-menu *{box-sizing:border-box}
+    #dse-cat-context-menu .dse-cat-menu-item{
+      display:flex;align-items:center;gap:9px;
+      width:100%;padding:7px 9px;border:0;border-radius:6px;
+      background:transparent;color:#e6e6e8;
+      font:inherit;text-align:left;white-space:nowrap;
+      cursor:pointer;outline:none;
+      -webkit-appearance:none;appearance:none;
+      transition:background .1s ease,color .1s ease;
+    }
+    #dse-cat-context-menu .dse-cat-menu-item:hover{
+      background:#3a3a3c;color:#fff;
+    }
+    #dse-cat-context-menu .dse-cat-menu-item:focus-visible{
+      background:#3a3a3c;box-shadow:inset 0 0 0 1px rgba(77,107,254,.55);
+    }
+    #dse-cat-context-menu .dse-cat-menu-item svg{
+      display:block;width:13px;height:13px;flex:0 0 auto;
+      color:#94949a;
+    }
+    #dse-cat-context-menu .dse-cat-menu-sep{
+      height:1px;margin:5px 4px;
+      background:rgba(255,255,255,.08);
+    }
+    #dse-cat-context-menu .dse-cat-menu-danger{color:#ff7b7b}
+    #dse-cat-context-menu .dse-cat-menu-danger svg{color:#ff7b7b}
+    #dse-cat-context-menu .dse-cat-menu-danger:hover{
+      background:rgba(255,80,80,.13);color:#ff9b9b;
+    }
+  `;
+
+  function injectStyle() {
+    if (document.getElementById(STYLE_ID)) return;
+    const style = document.createElement('style');
+    style.id = STYLE_ID;
+    style.textContent = CSS;
+    (document.head || document.documentElement).appendChild(style);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  //  DOM 创建 / 挂载
+  // ═══════════════════════════════════════════════════════════════════
+  function createContainer() {
+    const el = document.createElement('div');
+    el.id = UI_ID;
+    el.setAttribute('role', 'region');
+    el.setAttribute('aria-label', '项目分类');
+    el.innerHTML =
+      '<div class="dse-sc-head">' +
+        '<div class="dse-sc-head-main">' +
+          '<span class="dse-sc-icon" aria-hidden="true">' +
+            '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' +
+              '<path d="M3 7.5A2.5 2.5 0 0 1 5.5 5H10l2 2h6.5A2.5 2.5 0 0 1 21 9.5v7A2.5 2.5 0 0 1 18.5 19h-13A2.5 2.5 0 0 1 3 16.5z"></path>' +
+            '</svg>' +
+          '</span>' +
+          '<span class="dse-sc-title">项目分类</span>' +
+        '</div>' +
+        '<span class="dse-sc-total"></span>' +
+        '<button type="button" class="dse-sc-settings" title="管理分类" aria-label="管理分类">' +
+          '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">' +
+            '<path d="M12 5v14M5 12h14"></path>' +
+          '</svg>' +
+        '</button>' +
+      '</div>' +
+      '<div class="dse-sc-body"></div>';
+
+    el.addEventListener('click', onContainerClick);
+    el.addEventListener('keydown', onContainerKeydown);
+    el.addEventListener('contextmenu', onContainerContextMenu);
+    return el;
+  }
+
+  function onContainerClick(e) {
+    if (!(e.target instanceof Element)) return;
+
+    const settings = e.target.closest('.dse-sc-settings');
+    if (settings && container && container.contains(settings)) {
+      e.preventDefault();
+      e.stopPropagation();
+      openCategoryManager();
+      return;
+    }
+
+    const head = e.target.closest('.dse-sc-cat-head');
+    if (!head || !container || !container.contains(head)) return;
+    const item = head.closest('.dse-sc-cat');
+    if (!item) return;
+    e.preventDefault();
+    e.stopPropagation();
+    toggleCategory(item.dataset.catId);
+  }
+
+  function onContainerContextMenu(e) {
+    if (!(e.target instanceof Element)) return;
+    const head = e.target.closest('.dse-sc-cat-head');
+    if (!head || !container || !container.contains(head)) return;
+    const item = head.closest('.dse-sc-cat');
+    if (!item || !item.dataset.catId) return;
+    e.preventDefault();
+    e.stopPropagation();
+    openContextMenu(e.clientX, e.clientY, item.dataset.catId);
+  }
+
+  function onContainerKeydown(e) {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    if (!(e.target instanceof Element)) return;
+    const head = e.target.closest('.dse-sc-cat-head');
+    if (!head || e.target !== head || !container || !container.contains(head)) return;
+    const item = head.closest('.dse-sc-cat');
+    if (!item) return;
+    e.preventDefault();
+    e.stopPropagation();
+    toggleCategory(item.dataset.catId);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  //  打开原脚本的分类管理面板
+  // ═══════════════════════════════════════════════════════════════════
+  function openCategoryManager() {
+    const panel = document.getElementById('dse-panel');
+    if (!panel) {
+      console.warn('[DSE] 未找到 #dse-panel，无法打开分类管理');
+      return;
+    }
+
+    panel.classList.add('open');
+
+    // 复刻原脚本 posPanel 的定位，避免直接加 open 后出现在屏幕左上角
+    const fab = document.getElementById('dse-fab');
+    if (fab) {
+      const r = fab.getBoundingClientRect();
+      const pw = 460;
+      let left = r.left;
+      if (left + pw > window.innerWidth - 10) left = window.innerWidth - pw - 10;
+      if (left < 10) left = 10;
+      panel.style.left = left + 'px';
+      panel.style.bottom = (window.innerHeight - r.top + 10) + 'px';
+      panel.style.top = 'auto';
+    }
+
+    const tab = panel.querySelector('#dse-tabs button[data-tab="cats"]') ||
+      document.querySelector('#dse-tabs button[data-tab="cats"]');
+    if (tab) tab.click();
+
+    // 可选桥接：如果原脚本暴露了 __DSE_RELOAD_CATS__，顺便刷新它的闭包缓存
+    try {
+      if (typeof window.__DSE_RELOAD_CATS__ === 'function') {
+        window.__DSE_RELOAD_CATS__();
+      }
+    } catch { /* ignore */ }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  //  分类右键菜单
+  // ═══════════════════════════════════════════════════════════════════
+  function ensureContextMenu() {
+    if (contextMenu && contextMenu.isConnected) return contextMenu;
+
+    const existed = document.getElementById(MENU_ID);
+    if (existed) {
+      contextMenu = existed;
+      return existed;
+    }
+    if (!document.body) return null;
+
+    const menu = document.createElement('div');
+    menu.id = MENU_ID;
+    menu.setAttribute('role', 'menu');
+    menu.setAttribute('aria-hidden', 'true');
+    menu.innerHTML =
+      '<button type="button" class="dse-cat-menu-item" data-act="add" role="menuitem">' +
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">' +
+          '<path d="M12 5v14M5 12h14"></path>' +
+        '</svg>' +
+        '<span>将当前对话加入此分类</span>' +
+      '</button>' +
+      '<button type="button" class="dse-cat-menu-item" data-act="rename" role="menuitem">' +
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+          '<path d="M12 20h9"></path>' +
+          '<path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"></path>' +
+        '</svg>' +
+        '<span>重命名分类</span>' +
+      '</button>' +
+      '<div class="dse-cat-menu-sep" role="separator"></div>' +
+      '<button type="button" class="dse-cat-menu-item dse-cat-menu-danger" data-act="delete" role="menuitem">' +
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+          '<path d="M3 6h18"></path>' +
+          '<path d="M8 6V4h8v2"></path>' +
+          '<path d="M19 6l-1 14H6L5 6"></path>' +
+          '<path d="M10 11v6M14 11v6"></path>' +
+        '</svg>' +
+        '<span>删除分类</span>' +
+      '</button>';
+
+    menu.addEventListener('click', onContextMenuClick);
+    menu.addEventListener('contextmenu', e => e.preventDefault());
+    document.body.appendChild(menu);
+    contextMenu = menu;
+    return menu;
+  }
+
+  function initContextMenu() {
+    if (!document.body) return;
+    ensureContextMenu();
+    if (contextListenersBound) return;
+    contextListenersBound = true;
+
+    document.addEventListener('click', onDocumentClick, true);
+    document.addEventListener('contextmenu', onDocumentContextMenu, true);
+    document.addEventListener('keydown', onDocumentKeydown);
+    window.addEventListener('resize', hideContextMenu);
+    window.addEventListener('scroll', hideContextMenu, true);
+  }
+
+  function openContextMenu(x, y, catId) {
+    const menu = ensureContextMenu();
+    if (!menu) return;
+
+    contextCatId = catId;
+    menu.style.visibility = 'hidden';
+    menu.classList.add('open');
+    menu.setAttribute('aria-hidden', 'false');
+    menu.style.left = '0px';
+    menu.style.top = '0px';
+
+    const rect = menu.getBoundingClientRect();
+    const pad = 8;
+    let left = x;
+    let top = y;
+    if (left + rect.width > window.innerWidth - pad) {
+      left = window.innerWidth - rect.width - pad;
+    }
+    if (top + rect.height > window.innerHeight - pad) {
+      top = window.innerHeight - rect.height - pad;
+    }
+    menu.style.left = Math.max(pad, left) + 'px';
+    menu.style.top = Math.max(pad, top) + 'px';
+    menu.style.visibility = '';
+  }
+
+  function hideContextMenu() {
+    if (contextMenu) {
+      contextMenu.classList.remove('open');
+      contextMenu.setAttribute('aria-hidden', 'true');
+    }
+    contextCatId = null;
+  }
+
+  function onDocumentClick(e) {
+    if (!contextMenu || !contextMenu.classList.contains('open')) return;
+    if (e.target instanceof Node && contextMenu.contains(e.target)) return;
+    hideContextMenu();
+  }
+
+  function onDocumentContextMenu(e) {
+    if (!contextMenu || !contextMenu.classList.contains('open')) return;
+    if (e.target instanceof Node && contextMenu.contains(e.target)) return;
+    hideContextMenu();
+  }
+
+  function onDocumentKeydown(e) {
+    if (e.key === 'Escape') hideContextMenu();
+  }
+
+  function onContextMenuClick(e) {
+    if (!(e.target instanceof Element)) return;
+    const item = e.target.closest('.dse-cat-menu-item');
+    if (!item || !contextMenu || !contextMenu.contains(item)) return;
+
+    e.preventDefault();
+    e.stopPropagation();
+
+    const action = item.dataset.act;
+    const catId = contextCatId;
+    hideContextMenu();
+    if (!catId) return;
+
+    if (action === 'add') addCurrentSessionToCategory(catId);
+    else if (action === 'rename') renameCategory(catId);
+    else if (action === 'delete') deleteCategory(catId);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  //  分类数据写入（严格遵循 categories + sessionMap 结构）
+  // ═══════════════════════════════════════════════════════════════════
+  function readCatsForWrite() {
+    try {
+      const raw = localStorage.getItem(LS_CATS);
+      if (!raw) return null;
+      const data = JSON.parse(raw);
+      if (!data || typeof data !== 'object' || Array.isArray(data) || !Array.isArray(data.categories)) {
+        return null;
+      }
+      if (!data.sessionMap || typeof data.sessionMap !== 'object' || Array.isArray(data.sessionMap)) {
+        data.sessionMap = {};
+      }
+      return data;
+    } catch {
+      return null;
+    }
+  }
+
+  function writeCatsData(data) {
+    try {
+      const payload = {
+        categories: Array.isArray(data.categories) ? data.categories : [],
+        sessionMap: data.sessionMap && typeof data.sessionMap === 'object' && !Array.isArray(data.sessionMap)
+          ? data.sessionMap
+          : {}
+      };
+      localStorage.setItem(LS_CATS, JSON.stringify(payload));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function refreshAfterWrite(openCatId) {
+    if (openCatId) {
+      expanded.add(openCatId);
+      saveExpanded();
+    }
+    state = readCats();
+    render();
+  }
+
+  function addCurrentSessionToCategory(catId) {
+    const m = location.href.match(/\/s\/([A-Za-z0-9_-]{8,})/);
+    const sid = m ? m[1] : '';
+    if (!sid) {
+      alert('当前不在对话页面，请先打开一个对话再添加。');
+      return;
+    }
+
+    const data = readCatsForWrite();
+    if (!data) {
+      alert('读取分类数据失败，请刷新页面后重试。');
+      return;
+    }
+    const cat = data.categories.find(c => c && c.id === catId);
+    if (!cat) return;
+
+    const list = Array.isArray(data.sessionMap[sid]) ? data.sessionMap[sid] : [];
+    if (!list.includes(catId)) {
+      list.push(catId);
+      data.sessionMap[sid] = list;
+      if (!writeCatsData(data)) {
+        alert('保存分类失败，请检查浏览器存储权限。');
+        return;
+      }
+    } else {
+      data.sessionMap[sid] = list;
+    }
+
+    // 立即展开该分类并重绘，不等 1 秒轮询
+    refreshAfterWrite(catId);
+  }
+
+  function renameCategory(catId) {
+    const initial = readCatsForWrite();
+    if (!initial) {
+      alert('读取分类数据失败，请刷新页面后重试。');
+      return;
+    }
+    const initialCat = initial.categories.find(c => c && c.id === catId);
+    if (!initialCat) return;
+
+    const input = prompt('重命名分类', initialCat.name);
+    if (input === null) return;
+    const name = input.trim();
+    if (!name) {
+      alert('分类名称不能为空。');
+      return;
+    }
+    if (name === initialCat.name) return;
+
+    // prompt 期间数据可能被别处修改，重新读取最新数据再写
+    const data = readCatsForWrite();
+    if (!data) {
+      alert('读取分类数据失败，请刷新页面后重试。');
+      return;
+    }
+    const cat = data.categories.find(c => c && c.id === catId);
+    if (!cat) return;
+    if (data.categories.some(c => c && c.id !== catId && c.name === name)) {
+      alert('已存在同名分类。');
+      return;
+    }
+
+    cat.name = name;
+    if (!writeCatsData(data)) {
+      alert('保存分类失败，请检查浏览器存储权限。');
+      return;
+    }
+    refreshAfterWrite();
+  }
+
+  function deleteCategory(catId) {
+    const initial = readCatsForWrite();
+    if (!initial) {
+      alert('读取分类数据失败，请刷新页面后重试。');
+      return;
+    }
+    const initialCat = initial.categories.find(c => c && c.id === catId);
+    if (!initialCat) return;
+
+    if (!confirm('确定删除分类「' + initialCat.name + '」？\n只会删除分类，不会删除对话。')) return;
+
+    const data = readCatsForWrite();
+    if (!data) {
+      alert('读取分类数据失败，请刷新页面后重试。');
+      return;
+    }
+    if (!data.categories.some(c => c && c.id === catId)) return;
+
+    data.categories = data.categories.filter(c => c && c.id !== catId);
+    for (const sid of Object.keys(data.sessionMap)) {
+      const list = data.sessionMap[sid];
+      if (!Array.isArray(list)) {
+        delete data.sessionMap[sid];
+        continue;
+      }
+      const next = list.filter(id => id !== catId);
+      if (next.length) data.sessionMap[sid] = next;
+      else delete data.sessionMap[sid];
+    }
+
+    if (!writeCatsData(data)) {
+      alert('保存分类失败，请检查浏览器存储权限。');
+      return;
+    }
+
+    expanded.delete(catId);
+    saveExpanded();
+    refreshAfterWrite();
+  }
+
+  function ensureMounted() {
+    if (!document.body) return false;
+
+    const existing = document.getElementById(UI_ID);
+    if (existing && existing.isConnected) {
+      const existingBody = existing.querySelector('.dse-sc-body');
+      if (existingBody) {
+        container = existing;
+        bodyEl = existingBody;
+        totalEl = existing.querySelector('.dse-sc-total');
+        return true;
+      }
+      // 自己的节点结构被破坏，移除后重建
+      existing.remove();
+    }
+
+    const now = Date.now();
+    if (now - lastMountTry < 400) return false;
+    lastMountTry = now;
+
+    injectStyle();
+    const spot = findMountSpot();
+    if (!spot) return false;
+
+    const el = createContainer();
+    try {
+      spot.parent.insertBefore(el, spot.before || null);
+    } catch {
+      return false;
+    }
+
+    container = el;
+    bodyEl = el.querySelector('.dse-sc-body');
+    totalEl = el.querySelector('.dse-sc-total');
+    return true;
+  }
+
+  function toggleCategory(catId) {
+    if (!bodyEl || !catId) return;
+    const item = Array.from(bodyEl.querySelectorAll('.dse-sc-cat'))
+      .find(el => el.dataset.catId === catId);
+    if (!item) return;
+
+    const open = !item.classList.contains('is-open');
+    item.classList.toggle('is-open', open);
+    const head = item.querySelector('.dse-sc-cat-head');
+    if (head) head.setAttribute('aria-expanded', open ? 'true' : 'false');
+
+    if (open) expanded.add(catId);
+    else expanded.delete(catId);
+    saveExpanded();
+
+    if (open) {
+      scanDomTitles();
+      updateVisibleTitles();
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  //  渲染
+  // ═══════════════════════════════════════════════════════════════════
+  function makeEmpty(text) {
+    const el = document.createElement('div');
+    el.className = 'dse-sc-empty';
+    el.textContent = text;
+    return el;
+  }
+
+  function sessionsOf(catId) {
+    const out = [];
+    for (const [sid, catList] of Object.entries(state.sessionMap)) {
+      if (catList.includes(catId)) out.push(sid);
+    }
+    return out;
+  }
+
+  function syncActive() {
+    if (!container || !container.isConnected) return;
+    const sid = getCurrentSid();
+    container.querySelectorAll('a.dse-sc-session').forEach(a => {
+      const active = a.dataset.sid === sid;
+      a.classList.toggle('is-active', active);
+      if (active) a.setAttribute('aria-current', 'page');
+      else a.removeAttribute('aria-current');
+    });
+  }
+
+  function render() {
+    if (!ensureMounted() || !bodyEl) return;
+
+    const scrollTop = bodyEl.scrollTop;
+    scanDomTitles();
+
+    const validIds = new Set(state.categories.map(c => c.id));
+    let expandedChanged = false;
+    for (const id of [...expanded]) {
+      if (!validIds.has(id)) {
+        expanded.delete(id);
+        expandedChanged = true;
+      }
+    }
+    if (expandedChanged) saveExpanded();
+
+    if (totalEl) totalEl.textContent = state.categories.length ? String(state.categories.length) : '';
+
+    bodyEl.textContent = '';
+
+    if (!state.categories.length) {
+      bodyEl.appendChild(makeEmpty(state.unavailable ? '分类数据不可用' : '暂无分类'));
+      bodyEl.scrollTop = 0;
+      return;
+    }
+
+    const sharedMap = sharedTitleMap();
+    const currentSid = getCurrentSid();
+    const frag = document.createDocumentFragment();
+
+    for (const cat of state.categories) {
+      const sids = sessionsOf(cat.id);
+      const isOpen = expanded.has(cat.id);
+
+      const catEl = document.createElement('div');
+      catEl.className = 'dse-sc-cat' + (isOpen ? ' is-open' : '');
+      catEl.dataset.catId = cat.id;
+
+      const head = document.createElement('div');
+      head.className = 'dse-sc-cat-head';
+      head.setAttribute('role', 'button');
+      head.setAttribute('tabindex', '0');
+      head.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
+      head.title = '展开 / 收起「' + cat.name + '」';
+
+      const dot = document.createElement('span');
+      dot.className = 'dse-sc-dot';
+      dot.style.background = cat.color;
+
+      const name = document.createElement('span');
+      name.className = 'dse-sc-name';
+      name.textContent = cat.name;
+
+      const count = document.createElement('span');
+      count.className = 'dse-sc-count';
+      count.textContent = String(sids.length);
+
+      const chevron = document.createElement('span');
+      chevron.className = 'dse-sc-chevron';
+      chevron.setAttribute('aria-hidden', 'true');
+      chevron.textContent = '›';
+
+      head.append(dot, name, count, chevron);
+
+      const sessionsEl = document.createElement('div');
+      sessionsEl.className = 'dse-sc-sessions';
+
+      if (!sids.length) {
+        sessionsEl.appendChild(makeEmpty('暂无对话'));
+      } else {
+        for (const sid of sids) {
+          const title = resolveTitle(sid, sharedMap);
+
+          const link = document.createElement('a');
+          link.className = 'dse-sc-session' + (sid === currentSid ? ' is-active' : '');
+          link.dataset.sid = sid;
+          link.href = '/a/chat/s/' + encodeURIComponent(sid);
+          link.title = title;
+          if (sid === currentSid) link.setAttribute('aria-current', 'page');
+
+          const titleEl = document.createElement('span');
+          titleEl.className = 'dse-sc-session-title' + (title === sid.slice(0, 6) ? ' is-fallback' : '');
+          titleEl.textContent = title;
+
+          link.appendChild(titleEl);
+          sessionsEl.appendChild(link);
+        }
+      }
+
+      catEl.append(head, sessionsEl);
+      frag.appendChild(catEl);
+    }
+
+    bodyEl.appendChild(frag);
+    bodyEl.scrollTop = scrollTop;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  //  轮询 / 观察
+  // ═══════════════════════════════════════════════════════════════════
+  function tick(force) {
+    if (!document.body) return;
+    if (document.hidden && !force) return;
+
+    const hadContainer = !!document.getElementById(UI_ID);
+    const mountedNow = ensureMounted();
+    const next = readCats();
+    const changed = next.raw !== state.raw || next.unavailable !== state.unavailable;
+    state = next;
+
+    if ((!hadContainer && mountedNow) || changed || force) {
+      render();
+    } else {
+      // 定期补抓原生列表标题，处理原脚本重命名后的标题变化
+      if (container && Date.now() - lastTitleScan > 3000) scanDomTitles();
+      updateVisibleTitles();
+    }
+
+    syncActive();
+  }
+
+  function startObserver() {
+    if (!document.body || observer) return;
+    observer = new MutationObserver(() => {
+      if (!document.body) return;
+      if (document.getElementById(UI_ID)) return;
+      if (mountTimer) return;
+      mountTimer = setTimeout(() => {
+        mountTimer = null;
+        if (ensureMounted()) render();
+      }, 150);
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+  }
+
+  function boot() {
+    if (booted || !document.body) return;
+    booted = true;
+
+    injectStyle();
+    state = readCats();
+    if (ensureMounted()) render();
+    initContextMenu();
+
+    startObserver();
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = setInterval(() => tick(false), 1000);
+
+    // 侧边栏可能比 body 晚出现，补两次
+    setTimeout(() => tick(true), 800);
+    setTimeout(() => tick(true), 2400);
+  }
+
+  function onReady(fn) {
+    if (document.body) {
+      fn();
+      return;
+    }
+    let done = false;
+    const run = () => {
+      if (done) return;
+      done = true;
+      fn();
+    };
+    const observer = new MutationObserver(() => {
+      if (document.body) {
+        observer.disconnect();
+        run();
+      }
+    });
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+    document.addEventListener('DOMContentLoaded', () => {
+      if (document.body) run();
+    }, { once: true });
+  }
+
+  window.addEventListener('storage', (e) => {
+    if (e.key === LS_CATS || e.key === null) tick(true);
+  });
+
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) tick(true);
+  });
+
+  onReady(boot);
+})();
